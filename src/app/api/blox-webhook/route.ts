@@ -1,4 +1,8 @@
+import { execFile } from 'node:child_process';
+import { promisify } from 'node:util';
 import { NextRequest, NextResponse } from 'next/server';
+
+const execFileAsync = promisify(execFile);
 
 interface CompanyProfile {
   companyName?: string;
@@ -37,6 +41,15 @@ type SessionRecord = {
   workstreamId?: string;
   updatedAt: string;
 };
+
+interface OpenClawAgentJson {
+  ok?: boolean;
+  reply?: string;
+  message?: string;
+  sessionId?: string;
+  sessionKey?: string;
+  [key: string]: unknown;
+}
 
 const sessions = new Map<string, SessionRecord>();
 
@@ -82,6 +95,71 @@ function buildContext(profile?: CompanyProfile) {
   return parts.length ? parts.join(' | ') : 'Company profile provided but mostly empty.';
 }
 
+function buildOpenClawPrompt(body: BridgeRequest, context: string) {
+  const lines = [
+    'You are handling a BLOX web chat request.',
+    `Session key: ${body.sessionKey || 'not provided'}`,
+    `Workstream: ${body.workstreamId || 'default'}`,
+    `Role: ${body.role || 'ceo'}`,
+    body.agent ? `Requested agent: ${body.agent}` : null,
+    `Channel: ${body.channel || 'web'}`,
+    `Company context: ${context}`,
+    '',
+    'User message:',
+    body.message?.trim() || '',
+  ].filter(Boolean);
+
+  return lines.join('\n');
+}
+
+async function runOpenClawSession(sessionKey: string, prompt: string) {
+  const timeoutSeconds = Number(process.env.OPENCLAW_AGENT_TIMEOUT_SECONDS || 45);
+  const args = ['agent', '--to', sessionKey, '--message', prompt, '--json', '--timeout', String(timeoutSeconds)];
+
+  const { stdout, stderr } = await execFileAsync('openclaw', args, {
+    timeout: (timeoutSeconds + 5) * 1000,
+    maxBuffer: 1024 * 1024,
+    env: process.env,
+  });
+
+  const parsed = parseAgentJson(stdout);
+  const reply = extractReply(parsed, stdout);
+
+  return {
+    reply,
+    parsed,
+    stdout,
+    stderr,
+  };
+}
+
+function parseAgentJson(stdout: string): OpenClawAgentJson | null {
+  const trimmed = stdout.trim();
+  if (!trimmed) return null;
+
+  try {
+    return JSON.parse(trimmed) as OpenClawAgentJson;
+  } catch {
+    const start = trimmed.lastIndexOf('\n{');
+    const candidate = start >= 0 ? trimmed.slice(start + 1) : trimmed;
+    try {
+      return JSON.parse(candidate) as OpenClawAgentJson;
+    } catch {
+      return null;
+    }
+  }
+}
+
+function extractReply(parsed: OpenClawAgentJson | null, stdout: string) {
+  if (parsed && typeof parsed.reply === 'string' && parsed.reply.trim()) {
+    return parsed.reply.trim();
+  }
+  if (parsed && typeof parsed.message === 'string' && parsed.message.trim()) {
+    return parsed.message.trim();
+  }
+  return stdout.trim() || 'OpenClaw returned no reply.';
+}
+
 export async function POST(req: NextRequest) {
   const expectedBearer = process.env.BLOX_WEBHOOK_BEARER;
 
@@ -120,34 +198,44 @@ export async function POST(req: NextRequest) {
   saveSession(body.workstreamId, sessionKey);
 
   const context = buildContext(body.companyProfile);
-  const reply = [
-    `Bridge online. Session ${sessionKey} received your message.`,
-    `Role: ${body.role || 'ceo'}`,
-    body.agent ? `Requested agent: ${body.agent}` : null,
-    `Message: "${body.message.trim()}"`,
-    `Context: ${context}`,
-    '',
-    'Next step: wire this Vercel bridge to the real OpenClaw runtime.',
-  ]
-    .filter(Boolean)
-    .join('\n');
+  const prompt = buildOpenClawPrompt({ ...body, sessionKey }, context);
 
-  return NextResponse.json({
-    success: true,
-    reply,
-    sessionKey,
-    toolsUsed: [
-      {
-        agentName: 'Bridge',
-        toolKey: 'webhook',
-        summary: 'Accepted request through Vercel bridge.',
-      },
-    ],
-    metadata: {
+  try {
+    const result = await runOpenClawSession(sessionKey, prompt);
+
+    return NextResponse.json({
+      success: true,
+      reply: result.reply,
       sessionKey,
-      transport: 'bridge-mock',
-    },
-  });
+      toolsUsed: [
+        {
+          agentName: 'OpenClaw',
+          toolKey: 'openclaw-agent',
+          summary: 'Forwarded request into a dedicated OpenClaw session.',
+        },
+      ],
+      metadata: {
+        sessionKey,
+        transport: 'openclaw-agent',
+        sessionId: result.parsed?.sessionId ?? null,
+        rawOk: result.parsed?.ok ?? null,
+      },
+    });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : 'Unknown OpenClaw bridge error.';
+
+    return NextResponse.json(
+      {
+        success: false,
+        error: {
+          code: 'OPENCLAW_EXEC_ERROR',
+          message,
+        },
+        sessionKey,
+      },
+      { status: 502 }
+    );
+  }
 }
 
 export async function GET() {
