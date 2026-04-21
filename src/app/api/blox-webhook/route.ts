@@ -1,4 +1,8 @@
+import { execFile } from 'node:child_process';
+import { promisify } from 'node:util';
 import { NextRequest, NextResponse } from 'next/server';
+
+const execFileAsync = promisify(execFile);
 
 interface CompanyProfile {
   companyName?: string;
@@ -27,16 +31,33 @@ interface BridgeRequest {
   message?: string;
   channel?: 'web' | 'email' | 'sms';
   workstreamId?: string;
+  tenantId?: string;
+  userId?: string;
+  threadId?: string;
   role?: 'ceo' | 'agent';
   agent?: string;
   companyProfile?: CompanyProfile;
 }
+
+const BLOX_AGENT_ID = process.env.BLOX_OPENCLAW_AGENT_ID?.trim() || 'blox';
+const BLOX_SESSION_NAMESPACE = 'blox:web';
+const ACCEPTED_SESSION_PREFIXES = ['blox:', 'blox-'] as const;
+const FORBIDDEN_SESSION_KEYS = new Set(['agent:main:main', 'main', 'agent:main']);
 
 type SessionRecord = {
   sessionKey: string;
   workstreamId?: string;
   updatedAt: string;
 };
+
+interface OpenClawAgentJson {
+  ok?: boolean;
+  reply?: string;
+  message?: string;
+  sessionId?: string;
+  sessionKey?: string;
+  [key: string]: unknown;
+}
 
 const sessions = new Map<string, SessionRecord>();
 
@@ -46,12 +67,55 @@ function getBearerToken(req: NextRequest) {
   return auth.slice('Bearer '.length).trim();
 }
 
-function getSessionKey(workstreamId?: string, sessionKey?: string) {
-  if (sessionKey) return sessionKey;
-  if (!workstreamId) return 'blox-default';
-  const existing = sessions.get(workstreamId);
-  if (existing) return existing.sessionKey;
-  return `blox-${workstreamId}`;
+function sanitizeSegment(value: string) {
+  return value
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9._-]+/g, '-')
+    .replace(/-+/g, '-')
+    .replace(/^[-.]+|[-.]+$/g, '') || 'default';
+}
+
+function isAcceptableBloxKey(key: string) {
+  if (FORBIDDEN_SESSION_KEYS.has(key.toLowerCase())) return false;
+  return ACCEPTED_SESSION_PREFIXES.some((prefix) => key.startsWith(prefix));
+}
+
+function buildDeterministicKey(body: BridgeRequest) {
+  const tenantId = body.tenantId ? sanitizeSegment(body.tenantId) : null;
+  const userId = body.userId ? sanitizeSegment(body.userId) : null;
+  const threadId = body.threadId ? sanitizeSegment(body.threadId) : null;
+  if (tenantId && userId && threadId) {
+    return `${BLOX_SESSION_NAMESPACE}:${tenantId}:${userId}:${threadId}`;
+  }
+  if (body.workstreamId) {
+    const ws = sanitizeSegment(body.workstreamId);
+    const user = userId ?? 'anon';
+    return `${BLOX_SESSION_NAMESPACE}:workstream:${user}:${ws}`;
+  }
+  return `${BLOX_SESSION_NAMESPACE}:default:anon:default`;
+}
+
+function getSessionKey(body: BridgeRequest) {
+  const candidate = body.sessionKey?.trim();
+  if (candidate && isAcceptableBloxKey(candidate)) {
+    return { sessionKey: candidate };
+  }
+  if (candidate) {
+    return {
+      sessionKey: null,
+      error: `sessionKey "${candidate}" is not routable through the BLOX agent; must start with one of: ${ACCEPTED_SESSION_PREFIXES.join(', ')} and must not equal ${Array.from(
+        FORBIDDEN_SESSION_KEYS,
+      ).join(', ')}.`,
+    };
+  }
+  if (body.workstreamId) {
+    const existing = sessions.get(body.workstreamId);
+    if (existing && isAcceptableBloxKey(existing.sessionKey)) {
+      return { sessionKey: existing.sessionKey };
+    }
+  }
+  return { sessionKey: buildDeterministicKey(body) };
 }
 
 function saveSession(workstreamId: string | undefined, sessionKey: string) {
@@ -80,6 +144,124 @@ function buildContext(profile?: CompanyProfile) {
   }
 
   return parts.length ? parts.join(' | ') : 'Company profile provided but mostly empty.';
+}
+
+function buildOpenClawPrompt(body: BridgeRequest, context: string) {
+  const lines = [
+    'You are handling a BLOX web chat request.',
+    `Session key: ${body.sessionKey || 'not provided'}`,
+    `Workstream: ${body.workstreamId || 'default'}`,
+    `Role: ${body.role || 'ceo'}`,
+    body.agent ? `Requested agent: ${body.agent}` : null,
+    `Channel: ${body.channel || 'web'}`,
+    `Company context: ${context}`,
+    '',
+    'User message:',
+    body.message?.trim() || '',
+  ].filter(Boolean);
+
+  return lines.join('\n');
+}
+
+async function runOpenClawSession(sessionKey: string, prompt: string) {
+  const relayUrl = process.env.BLOX_RELAY_URL;
+  if (relayUrl) {
+    return runRelaySession(relayUrl, sessionKey, prompt);
+  }
+
+  const timeoutSeconds = Number(process.env.OPENCLAW_AGENT_TIMEOUT_SECONDS || 45);
+  const args = [
+    'agent',
+    '--agent',
+    BLOX_AGENT_ID,
+    '--to',
+    sessionKey,
+    '--message',
+    prompt,
+    '--json',
+    '--timeout',
+    String(timeoutSeconds),
+  ];
+
+  const { stdout, stderr } = await execFileAsync('openclaw', args, {
+    timeout: (timeoutSeconds + 5) * 1000,
+    maxBuffer: 1024 * 1024,
+    env: process.env,
+  });
+
+  const parsed = parseAgentJson(stdout);
+  const reply = extractReply(parsed, stdout);
+
+  return {
+    reply,
+    parsed,
+    stdout,
+    stderr,
+    transport: 'openclaw-agent',
+  };
+}
+
+async function runRelaySession(relayUrl: string, sessionKey: string, prompt: string) {
+  const response = await fetch(relayUrl, {
+    method: 'POST',
+    headers: {
+      'content-type': 'application/json',
+      ...(process.env.BLOX_RELAY_BEARER
+        ? { authorization: `Bearer ${process.env.BLOX_RELAY_BEARER}` }
+        : {}),
+    },
+    body: JSON.stringify({
+      sessionKey,
+      message: prompt,
+    }),
+    cache: 'no-store',
+  });
+
+  const payload = (await response.json()) as {
+    ok?: boolean;
+    reply?: string;
+    metadata?: OpenClawAgentJson;
+    error?: string;
+  };
+
+  if (!response.ok || !payload.ok) {
+    throw new Error(payload.error || `Relay request failed with status ${response.status}.`);
+  }
+
+  return {
+    reply: payload.reply || 'OpenClaw relay returned no reply.',
+    parsed: payload.metadata || null,
+    stdout: '',
+    stderr: '',
+    transport: 'openclaw-agent-relay',
+  };
+}
+
+function parseAgentJson(stdout: string): OpenClawAgentJson | null {
+  const trimmed = stdout.trim();
+  if (!trimmed) return null;
+
+  try {
+    return JSON.parse(trimmed) as OpenClawAgentJson;
+  } catch {
+    const start = trimmed.lastIndexOf('\n{');
+    const candidate = start >= 0 ? trimmed.slice(start + 1) : trimmed;
+    try {
+      return JSON.parse(candidate) as OpenClawAgentJson;
+    } catch {
+      return null;
+    }
+  }
+}
+
+function extractReply(parsed: OpenClawAgentJson | null, stdout: string) {
+  if (parsed && typeof parsed.reply === 'string' && parsed.reply.trim()) {
+    return parsed.reply.trim();
+  }
+  if (parsed && typeof parsed.message === 'string' && parsed.message.trim()) {
+    return parsed.message.trim();
+  }
+  return stdout.trim() || 'OpenClaw returned no reply.';
 }
 
 export async function POST(req: NextRequest) {
@@ -116,38 +298,63 @@ export async function POST(req: NextRequest) {
     );
   }
 
-  const sessionKey = getSessionKey(body.workstreamId, body.sessionKey);
+  const resolved = getSessionKey(body);
+  if (!resolved.sessionKey) {
+    return NextResponse.json(
+      {
+        success: false,
+        error: {
+          code: 'VALIDATION_ERROR',
+          message: resolved.error ?? 'Invalid session key.',
+        },
+      },
+      { status: 400 }
+    );
+  }
+  const sessionKey = resolved.sessionKey;
   saveSession(body.workstreamId, sessionKey);
 
   const context = buildContext(body.companyProfile);
-  const reply = [
-    `Bridge online. Session ${sessionKey} received your message.`,
-    `Role: ${body.role || 'ceo'}`,
-    body.agent ? `Requested agent: ${body.agent}` : null,
-    `Message: "${body.message.trim()}"`,
-    `Context: ${context}`,
-    '',
-    'Next step: wire this Vercel bridge to the real OpenClaw runtime.',
-  ]
-    .filter(Boolean)
-    .join('\n');
+  const prompt = buildOpenClawPrompt({ ...body, sessionKey }, context);
 
-  return NextResponse.json({
-    success: true,
-    reply,
-    sessionKey,
-    toolsUsed: [
-      {
-        agentName: 'Bridge',
-        toolKey: 'webhook',
-        summary: 'Accepted request through Vercel bridge.',
-      },
-    ],
-    metadata: {
+  try {
+    const result = await runOpenClawSession(sessionKey, prompt);
+
+    return NextResponse.json({
+      success: true,
+      reply: result.reply,
       sessionKey,
-      transport: 'bridge-mock',
-    },
-  });
+      toolsUsed: [
+        {
+          agentName: 'OpenClaw',
+          toolKey: 'openclaw-agent',
+          summary: 'Forwarded request into the isolated BLOX OpenClaw agent session.',
+        },
+      ],
+      metadata: {
+        sessionKey,
+        agentId: BLOX_AGENT_ID,
+        sessionNamespace: BLOX_SESSION_NAMESPACE,
+        transport: result.transport,
+        sessionId: result.parsed?.sessionId ?? null,
+        rawOk: result.parsed?.ok ?? null,
+      },
+    });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : 'Unknown OpenClaw bridge error.';
+
+    return NextResponse.json(
+      {
+        success: false,
+        error: {
+          code: 'OPENCLAW_EXEC_ERROR',
+          message,
+        },
+        sessionKey,
+      },
+      { status: 502 }
+    );
+  }
 }
 
 export async function GET() {
@@ -155,5 +362,10 @@ export async function GET() {
     success: true,
     ok: true,
     message: 'BLOX OpenClaw bridge is running.',
+    agentId: BLOX_AGENT_ID,
+    sessionNamespace: BLOX_SESSION_NAMESPACE,
+    acceptedSessionPrefixes: ACCEPTED_SESSION_PREFIXES,
+    forbiddenSessionKeys: Array.from(FORBIDDEN_SESSION_KEYS),
+    transport: process.env.BLOX_RELAY_URL ? 'openclaw-agent-relay' : 'openclaw-agent',
   });
 }
