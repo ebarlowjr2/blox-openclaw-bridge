@@ -113,6 +113,11 @@ function buildOpenClawPrompt(body: BridgeRequest, context: string) {
 }
 
 async function runOpenClawSession(sessionKey: string, prompt: string) {
+  const relayUrl = process.env.BLOX_RELAY_URL;
+  if (relayUrl) {
+    return runRelaySession(relayUrl, sessionKey, prompt);
+  }
+
   const timeoutSeconds = Number(process.env.OPENCLAW_AGENT_TIMEOUT_SECONDS || 45);
   const args = ['agent', '--to', sessionKey, '--message', prompt, '--json', '--timeout', String(timeoutSeconds)];
 
@@ -130,6 +135,43 @@ async function runOpenClawSession(sessionKey: string, prompt: string) {
     parsed,
     stdout,
     stderr,
+    transport: 'openclaw-agent',
+  };
+}
+
+async function runRelaySession(relayUrl: string, sessionKey: string, prompt: string) {
+  const response = await fetch(relayUrl, {
+    method: 'POST',
+    headers: {
+      'content-type': 'application/json',
+      ...(process.env.BLOX_RELAY_BEARER
+        ? { authorization: `Bearer ${process.env.BLOX_RELAY_BEARER}` }
+        : {}),
+    },
+    body: JSON.stringify({
+      sessionKey,
+      message: prompt,
+    }),
+    cache: 'no-store',
+  });
+
+  const payload = (await response.json()) as {
+    ok?: boolean;
+    reply?: string;
+    metadata?: OpenClawAgentJson;
+    error?: string;
+  };
+
+  if (!response.ok || !payload.ok) {
+    throw new Error(payload.error || `Relay request failed with status ${response.status}.`);
+  }
+
+  return {
+    reply: payload.reply || 'OpenClaw relay returned no reply.',
+    parsed: payload.metadata || null,
+    stdout: '',
+    stderr: '',
+    transport: 'openclaw-agent-relay',
   };
 }
 
@@ -216,7 +258,7 @@ export async function POST(req: NextRequest) {
       ],
       metadata: {
         sessionKey,
-        transport: 'openclaw-agent',
+        transport: result.transport,
         sessionId: result.parsed?.sessionId ?? null,
         rawOk: result.parsed?.ok ?? null,
       },
