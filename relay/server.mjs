@@ -3,9 +3,15 @@ import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 
 const execFileAsync = promisify(execFile);
+
 const port = Number(process.env.PORT || 8787);
 const bearer = process.env.BLOX_RELAY_BEARER || '';
 const timeoutSeconds = Number(process.env.OPENCLAW_AGENT_TIMEOUT_SECONDS || 45);
+const agentId = (process.env.BLOX_RELAY_AGENT_ID || 'blox').trim();
+
+const ACCEPTED_SESSION_PREFIXES = ['blox:', 'blox-'];
+const SESSION_NAMESPACE = 'blox:web';
+const FORBIDDEN_SESSION_KEYS = new Set(['agent:main:main', 'main', 'agent:main']);
 
 function sendJson(res, status, payload) {
   const body = JSON.stringify(payload);
@@ -64,8 +70,43 @@ function extractReply(parsed, stdout) {
   return stdout.trim() || 'OpenClaw returned no reply.';
 }
 
+function validateSessionKey(sessionKey) {
+  if (!sessionKey || typeof sessionKey !== 'string') {
+    return { ok: false, error: 'sessionKey is required.' };
+  }
+  const trimmed = sessionKey.trim();
+  if (!trimmed) {
+    return { ok: false, error: 'sessionKey must not be blank.' };
+  }
+  if (FORBIDDEN_SESSION_KEYS.has(trimmed.toLowerCase())) {
+    return {
+      ok: false,
+      error: `sessionKey "${trimmed}" is reserved for the main agent lane and is not routable through the BLOX relay.`,
+    };
+  }
+  const acceptable = ACCEPTED_SESSION_PREFIXES.some((prefix) => trimmed.startsWith(prefix));
+  if (!acceptable) {
+    return {
+      ok: false,
+      error: `sessionKey must start with one of: ${ACCEPTED_SESSION_PREFIXES.join(', ')} (got "${trimmed}").`,
+    };
+  }
+  return { ok: true, sessionKey: trimmed };
+}
+
 async function runOpenClaw({ sessionKey, message }) {
-  const args = ['agent', '--to', sessionKey, '--message', message, '--json', '--timeout', String(timeoutSeconds)];
+  const args = [
+    'agent',
+    '--agent',
+    agentId,
+    '--to',
+    sessionKey,
+    '--message',
+    message,
+    '--json',
+    '--timeout',
+    String(timeoutSeconds),
+  ];
   const { stdout, stderr } = await execFileAsync('openclaw', args, {
     timeout: (timeoutSeconds + 5) * 1000,
     maxBuffer: 1024 * 1024,
@@ -81,9 +122,32 @@ async function runOpenClaw({ sessionKey, message }) {
   };
 }
 
+async function startupValidation() {
+  if (agentId === 'main') {
+    throw new Error(
+      'BLOX relay refuses to start with BLOX_RELAY_AGENT_ID="main". The BLOX relay must never route to the main agent lane.',
+    );
+  }
+  try {
+    const { stdout } = await execFileAsync('openclaw', ['--version'], { timeout: 5000 });
+    console.log(`[blox-relay] openclaw CLI detected: ${stdout.trim()}`);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    console.warn(`[blox-relay] WARNING: openclaw CLI check failed: ${message}`);
+  }
+}
+
 const server = createServer(async (req, res) => {
   if (req.method === 'GET' && req.url === '/health') {
-    return sendJson(res, 200, { ok: true, service: 'blox-openclaw-relay' });
+    return sendJson(res, 200, {
+      ok: true,
+      service: 'blox-openclaw-relay',
+      agentId,
+      sessionNamespace: SESSION_NAMESPACE,
+      acceptedSessionPrefixes: ACCEPTED_SESSION_PREFIXES,
+      forbiddenSessionKeys: Array.from(FORBIDDEN_SESSION_KEYS),
+      timeoutSeconds,
+    });
   }
 
   if (req.method !== 'POST' || req.url !== '/relay') {
@@ -99,23 +163,34 @@ const server = createServer(async (req, res) => {
 
   try {
     const body = await readJsonBody(req);
-    const sessionKey = typeof body.sessionKey === 'string' && body.sessionKey.trim() ? body.sessionKey.trim() : null;
+    const validation = validateSessionKey(body.sessionKey);
     const message = typeof body.message === 'string' && body.message.trim() ? body.message.trim() : null;
 
-    if (!sessionKey || !message) {
+    if (!validation.ok) {
       return sendJson(res, 400, {
         ok: false,
-        error: 'sessionKey and message are required.',
+        error: validation.error,
+        agentId,
+      });
+    }
+    if (!message) {
+      return sendJson(res, 400, {
+        ok: false,
+        error: 'message is required.',
+        agentId,
       });
     }
 
+    const sessionKey = validation.sessionKey;
     const result = await runOpenClaw({ sessionKey, message });
     return sendJson(res, 200, {
       ok: true,
       reply: result.reply,
       sessionKey,
+      agentId,
       metadata: {
         transport: 'openclaw-agent-relay',
+        agentId,
         sessionId: result.parsed?.sessionId ?? null,
         rawOk: result.parsed?.ok ?? null,
       },
@@ -124,10 +199,22 @@ const server = createServer(async (req, res) => {
     return sendJson(res, 502, {
       ok: false,
       error: error instanceof Error ? error.message : 'Unknown relay error.',
+      agentId,
     });
   }
 });
 
-server.listen(port, () => {
-  console.log(`blox-openclaw-relay listening on :${port}`);
-});
+startupValidation()
+  .then(() => {
+    server.listen(port, () => {
+      console.log(
+        `[blox-relay] listening on :${port} agent=${agentId} namespace=${SESSION_NAMESPACE} prefixes=${ACCEPTED_SESSION_PREFIXES.join(
+          '|',
+        )}`,
+      );
+    });
+  })
+  .catch((error) => {
+    console.error(`[blox-relay] startup failed: ${error instanceof Error ? error.message : error}`);
+    process.exit(1);
+  });
