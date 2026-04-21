@@ -158,7 +158,7 @@ function buildOpenClawPrompt(body: BridgeRequest, context: string) {
     '',
     'User message:',
     body.message?.trim() || '',
-  ].filter(Boolean);
+  ].filter((line): line is string => line !== null);
 
   return lines.join('\n');
 }
