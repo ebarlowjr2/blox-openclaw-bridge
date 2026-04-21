@@ -6,7 +6,7 @@ const execFileAsync = promisify(execFile);
 
 const port = Number(process.env.PORT || 8787);
 const bearer = process.env.BLOX_RELAY_BEARER || '';
-const timeoutSeconds = Number(process.env.OPENCLAW_AGENT_TIMEOUT_SECONDS || 45);
+const timeoutSeconds = Number(process.env.OPENCLAW_AGENT_TIMEOUT_SECONDS || 120);
 const agentId = (process.env.BLOX_RELAY_AGENT_ID || 'blox').trim();
 
 const ACCEPTED_SESSION_PREFIXES = ['blox:', 'blox-'];
