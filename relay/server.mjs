@@ -61,13 +61,38 @@ function parseAgentJson(stdout) {
 }
 
 function extractReply(parsed, stdout) {
-  if (parsed && typeof parsed.reply === 'string' && parsed.reply.trim()) {
-    return parsed.reply.trim();
-  }
-  if (parsed && typeof parsed.message === 'string' && parsed.message.trim()) {
-    return parsed.message.trim();
+  if (parsed) {
+    const payloads = Array.isArray(parsed.result?.payloads) ? parsed.result.payloads : null;
+    if (payloads) {
+      const text = payloads
+        .map((p) => (typeof p?.text === 'string' ? p.text : ''))
+        .filter((t) => t.trim().length > 0)
+        .join('\n\n')
+        .trim();
+      if (text) return text;
+    }
+
+    const visible = parsed.result?.meta?.finalAssistantVisibleText;
+    if (typeof visible === 'string' && visible.trim()) return visible.trim();
+
+    if (typeof parsed.reply === 'string' && parsed.reply.trim()) {
+      return parsed.reply.trim();
+    }
+    if (typeof parsed.message === 'string' && parsed.message.trim()) {
+      return parsed.message.trim();
+    }
   }
   return stdout.trim() || 'OpenClaw returned no reply.';
+}
+
+function extractSessionId(parsed) {
+  if (!parsed) return null;
+  return (
+    parsed.result?.meta?.agentMeta?.sessionId ??
+    parsed.result?.meta?.sessionId ??
+    parsed.sessionId ??
+    null
+  );
 }
 
 function validateSessionKey(sessionKey) {
@@ -191,7 +216,7 @@ const server = createServer(async (req, res) => {
       metadata: {
         transport: 'openclaw-agent-relay',
         agentId,
-        sessionId: result.parsed?.sessionId ?? null,
+        sessionId: extractSessionId(result.parsed),
         rawOk: result.parsed?.ok ?? null,
       },
     });
