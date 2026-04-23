@@ -50,12 +50,36 @@ type SessionRecord = {
   updatedAt: string;
 };
 
+interface OpenClawAgentPayload {
+  text?: string | null;
+  mediaUrl?: string | null;
+}
+
+interface OpenClawAgentMeta {
+  finalAssistantVisibleText?: string;
+  finalAssistantRawText?: string;
+  agentMeta?: {
+    sessionId?: string;
+    provider?: string;
+    model?: string;
+  };
+  sessionId?: string;
+}
+
+interface OpenClawAgentResult {
+  payloads?: OpenClawAgentPayload[];
+  meta?: OpenClawAgentMeta;
+}
+
 interface OpenClawAgentJson {
   ok?: boolean;
   reply?: string;
   message?: string;
   sessionId?: string;
   sessionKey?: string;
+  status?: string;
+  runId?: string;
+  result?: OpenClawAgentResult;
   [key: string]: unknown;
 }
 
@@ -158,7 +182,7 @@ function buildOpenClawPrompt(body: BridgeRequest, context: string) {
     '',
     'User message:',
     body.message?.trim() || '',
-  ].filter(Boolean);
+  ].filter((line): line is string => line !== null);
 
   return lines.join('\n');
 }
@@ -255,13 +279,36 @@ function parseAgentJson(stdout: string): OpenClawAgentJson | null {
 }
 
 function extractReply(parsed: OpenClawAgentJson | null, stdout: string) {
-  if (parsed && typeof parsed.reply === 'string' && parsed.reply.trim()) {
-    return parsed.reply.trim();
-  }
-  if (parsed && typeof parsed.message === 'string' && parsed.message.trim()) {
-    return parsed.message.trim();
+  if (parsed) {
+    const payloads = Array.isArray(parsed.result?.payloads) ? parsed.result.payloads : null;
+    const payloadText = payloads
+      ?.map((p) => (typeof p?.text === 'string' ? p.text : ''))
+      .filter((t) => t.trim().length > 0)
+      .join('\n\n')
+      .trim();
+    if (payloadText) return payloadText;
+
+    const visible = parsed.result?.meta?.finalAssistantVisibleText;
+    if (typeof visible === 'string' && visible.trim()) return visible.trim();
+
+    if (typeof parsed.reply === 'string' && parsed.reply.trim()) {
+      return parsed.reply.trim();
+    }
+    if (typeof parsed.message === 'string' && parsed.message.trim()) {
+      return parsed.message.trim();
+    }
   }
   return stdout.trim() || 'OpenClaw returned no reply.';
+}
+
+function extractSessionId(parsed: OpenClawAgentJson | null): string | null {
+  if (!parsed) return null;
+  return (
+    parsed.result?.meta?.agentMeta?.sessionId ??
+    parsed.result?.meta?.sessionId ??
+    parsed.sessionId ??
+    null
+  );
 }
 
 export async function POST(req: NextRequest) {
@@ -336,7 +383,7 @@ export async function POST(req: NextRequest) {
         agentId: BLOX_AGENT_ID,
         sessionNamespace: BLOX_SESSION_NAMESPACE,
         transport: result.transport,
-        sessionId: result.parsed?.sessionId ?? null,
+        sessionId: extractSessionId(result.parsed),
         rawOk: result.parsed?.ok ?? null,
       },
     });
