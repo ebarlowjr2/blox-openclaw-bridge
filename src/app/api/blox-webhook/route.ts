@@ -280,7 +280,8 @@ function parseAgentJson(stdout: string): OpenClawAgentJson | null {
 
 function extractReply(parsed: OpenClawAgentJson | null, stdout: string) {
   if (parsed) {
-    const payloadText = parsed.result?.payloads
+    const payloads = Array.isArray(parsed.result?.payloads) ? parsed.result.payloads : null;
+    const payloadText = payloads
       ?.map((p) => (typeof p?.text === 'string' ? p.text : ''))
       .filter((t) => t.trim().length > 0)
       .join('\n\n')
